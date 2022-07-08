@@ -1,18 +1,26 @@
-use std::error::Error;
+pub mod context;
+pub mod identifiers;
+pub mod token;
+
 use std::fmt::{Debug, Display, Formatter};
 use std::iter::{Peekable, Skip};
 use std::ops::Range;
 use std::num::ParseIntError;
 use std::str::Chars;
-use crate::token::{CharExt, Delimiter, DelimiterKind, Identifier, IdentifierRegistry, Keyword, Literal, Punctuation, Token, TokenKind};
+use crate::diagnostics::Span;
+use crate::lexer::context::LexerContext;
+use crate::lexer::token::{LiteralKind, LitInt, LitStr, OperatorKind, SeparatorKind, Token, TokenKind};
+use crate::source::Source;
 
 #[cfg(test)]
 mod test {
+    use crate::lexer::token::{KeywordKind, Token};
+    use crate::source::StrSource;
     use super::*;
 
     type AnyResult = std::result::Result<(), Box<dyn std::error::Error>>;
 
-    fn get_tokens(source: &str) -> Result<(Vec<Token>, LexerContext)> {
+    /*fn get_tokens(source: &str) -> Result<(Vec<Token>, LexerContext)> {
         let mut context = LexerContext::default();
         let mut source = StrSource::new(source);
         let tokens: Result<Vec<Token>> = source.tokens(&mut context).collect();
@@ -28,23 +36,24 @@ mod test {
                 $(assert_eq!(context, $context);)*
             }
         }
-    }
+    }*/
 
-    #[test]
+    /*#[test]
     fn test_blank() -> AnyResult {
-        lexer_test!("", vec!());
-        lexer_test!("  ", vec!());
+        lexer_test!("", tokens!());
+        lexer_test!("  ", tokens!());
 
         Ok(())
     }
 
     #[test]
     fn test_integers() -> AnyResult {
-        let expected = vec!(
-            Token::integer(123),
-            Token::integer(567),
-            Token::integer(1),
-            Token::integer(5));
+        let expected = tokens! {
+            int 123;
+            int 567;
+            int 1;
+            int 5;
+        };
 
         lexer_test!(" 123  567  1 5", expected);
         lexer_test!(" 123  567  1 5  ", expected);
@@ -54,14 +63,13 @@ mod test {
 
     #[test]
     fn test_keywords() -> AnyResult {
-        let expected = vec!(
-            Token::integer(1),
-            Keyword::Xor.into(),
-            Token::integer(2)
-        );
+        let expected = tokens! {
+            int 1;
+            tkn KeywordKind::Xor;
+            int 2;
+        };
 
         lexer_test!(" 1 xor 2  ", expected);
-        lexer_test!("    if", vec!(Keyword::If.into()));
 
         Ok(())
     }
@@ -115,7 +123,7 @@ mod test {
             Identifier::from_id(1).into(),
             Punctuation::Assign.into(),
             Token::integer(1),
-            Punctuation::Mul.into(),
+            Punctuation::Asterisk.into(),
             Identifier::from_id(2).into(),
             Punctuation::Add.into(),
             Token::integer(5678),
@@ -123,7 +131,7 @@ mod test {
             Identifier::from_id(3).into(),
             Delimiter::opening(DelimiterKind::SquareBracket).into(),
             Token::integer(2),
-            Punctuation::Mul.into(),
+            Punctuation::Asterisk.into(),
             Identifier::from_id(4).into(),
             Punctuation::Sub.into(),
             Identifier::from_id(2).into(),
@@ -143,259 +151,237 @@ mod test {
             LexerContext::with_idents(idents));
 
         Ok(())
+    }*/
+}
+
+#[derive(Debug, Clone)]
+pub enum ParseTokenError {
+    ParseIntError(ParseIntError)
+}
+
+impl Display for ParseTokenError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ParseTokenError::ParseIntError(err) =>
+                f.write_fmt(format_args!("{}", err))
+        }
+    }
+}
+
+impl std::error::Error for ParseTokenError {}
+
+impl From<ParseIntError> for ParseTokenError {
+    fn from(value: ParseIntError) -> Self {
+        ParseTokenError::ParseIntError(value)
     }
 }
 
 #[derive(Debug, Clone)]
 pub enum ErrorKind {
-    UnexpectedCharacter(char),
-    UnexpectedToken(Range<usize>),
-    ParseIntError(ParseIntError),
+    UnexpectedCharacter(String),
+    ParseTokenError(ParseTokenError),
     Eof
+}
+
+impl From<ParseTokenError> for ErrorKind {
+    fn from(value: ParseTokenError) -> Self {
+        ErrorKind::ParseTokenError(value)
+    }
 }
 
 impl From<ParseIntError> for ErrorKind {
     fn from(value: ParseIntError) -> Self {
-        ErrorKind::ParseIntError(value)
+        ParseTokenError::from(value).into()
     }
 }
 
-impl Display for ErrorKind {
+#[derive(Debug)]
+pub struct Error {
+    kind: ErrorKind,
+    span: Span
+}
+
+impl Error {
+    fn new(kind: ErrorKind, span: Span) -> Error {
+        Error {
+            kind, span
+        }
+    }
+
+    fn kind(&self) -> &ErrorKind {
+        &self.kind
+    }
+
+    fn span(&self) -> Span {
+        self.span
+    }
+}
+
+impl Display for Error {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ErrorKind::UnexpectedCharacter(ref ch) => {
-                f.write_fmt(format_args!("unexpected character: {}", ch))
-            }
-            ErrorKind::UnexpectedToken(tkn) => {
-                f.write_fmt(format_args!("unexpected token in [{}..{})", tkn.start, tkn.end))
-            }
+        match &self.kind {
+            ErrorKind::UnexpectedCharacter(ref err) =>
+                f.write_str(err),
             ErrorKind::Eof => f.write_str("unexpected EOF"),
-            ErrorKind::ParseIntError(err) => {
-                f.write_fmt(format_args!("{}", err))
-            }
+            ErrorKind::ParseTokenError(err) =>
+                f.write_fmt(format_args!("cannot parse token in [{}..{}) ({})",
+                                         self.span.start(),
+                                         self.span.end(),
+                                         err))
         }
     }
 }
 
-impl Error for ErrorKind {}
+impl std::error::Error for Error {}
 
-pub type Result<T> = std::result::Result<T, ErrorKind>;
+pub type Result<T> = std::result::Result<T, Error>;
 
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct LexerContext {
-    idents: IdentifierRegistry
-}
-
-impl<'a> LexerContext {
-    pub fn with_idents(registry: IdentifierRegistry) -> LexerContext {
-        LexerContext {
-            idents: registry
-        }
+/// Trait that describes how to create
+/// token from the stream of characters
+///
+/// This trait is the core part of lexer.
+trait NextToken {
+    /// Returns whether this token could start with the
+    /// given character
+    ///
+    /// The default implementation always returns true.
+    ///
+    /// # Arguments
+    /// * `ch` - First character of the token
+    fn check(ch: char) -> bool {
+        return true;
     }
 
-    pub fn idents_mut(&'a mut self) -> &'a mut IdentifierRegistry {
-        &mut self.idents
-    }
+    /// Returns the next token or error
+    ///
+    /// Implementations may assume that [`NextToken::check`] returns
+    /// true for the first character of input and [`Source::pos`] (later - `cursor position`)
+    /// for `source` returns the position of the first character (cursor points to `first`).
+    /// After the method returns, the cursor should be set right after the
+    /// last character belonging to the token. In case of an error, the cursor position should left
+    /// unchanged since the method was called.
+    ///
+    /// # Arguments
+    /// * `first` - The first character of `source`
+    /// * `source` - An abstract source of characters. The cursor is set to the first character
+    fn next_token<'a, S>(first: char, source: S) -> Result<Self>
+        where
+            S: Source<'a>,
+            Self: Sized;
 }
 
-impl Default for LexerContext {
-    fn default() -> Self {
-        LexerContext {
-            idents: IdentifierRegistry::new()
-        }
-    }
-}
-
-pub trait Source<'a> {
-    fn peek(&mut self) -> Option<char>;
-    fn get(&mut self) -> Option<char>;
-    fn pos(&self) -> usize;
-    fn slice(&self, range: Range<usize>) -> &'a str;
-
-    fn next_pos(&self) -> usize {
-        self.pos()+1
-    }
-
-    fn tokens(&'a mut self, context: &'a mut LexerContext) -> Tokens<'a, Self>
-        where Self: Sized {
-        Tokens::new(self, context)
-    }
-}
-
-pub struct Tokens<'a, T: Source<'a>> {
-    lexer: Lexer<'a, T>
-}
-
-impl<'a, T: Source<'a>> Tokens<'a, T> {
-    fn new(source: &'a mut T, context: &'a mut LexerContext) -> Tokens<'a, T> {
-        Tokens {
-            lexer: Lexer::new(source, context)
+/// Helper macro to combine uses of [`NextToken`] trait
+macro_rules! try_next_token {
+    ($type:ty, $first:expr, $source:expr) => {
+        if <$type as NextToken>::check($first) {
+            let result = <$type as NextToken>::next_token($first, $source)?;
+            return Ok(result.into());
         }
     }
 }
 
-impl<'a, T: Source<'a>> Iterator for Tokens<'a, T> {
-    type Item = Result<Token>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        match self.lexer.next_token() {
-            Ok(token) => Some(Ok(token)),
-            Err(err) => {
-                if let ErrorKind::Eof = err {
-                    return None
-                }
-
-                return Some(Err(err))
-            }
-        }
-    }
-}
-
-struct StrSource<'a> {
-    content: &'a str,
-    iter: Peekable<Skip<Chars<'a>>>,
-    pos: usize,
-    next_pos: usize
-}
-
-impl<'a> StrSource<'a> {
-    pub fn new(source: &'a str) -> StrSource<'a> {
-        let first_ch = source.chars().next();
-        let next_pos = if let Some(ch) = first_ch {
-              ch.len_utf8()
-        } else {
-            0
-        };
-
-        StrSource {
-            content: source,
-            iter: source.chars().skip(1).peekable(),
-            pos: 0,
-            next_pos
-        }
-    }
-}
-
-impl<'a> Source<'a> for StrSource<'a> {
-    fn peek(&mut self) -> Option<char> {
-        self.iter.peek().map(|ch| *ch)
+impl NextToken for LitInt {
+    fn check(ch: char) -> bool {
+        return ch.is_ascii_digit()
     }
 
-    fn get(&mut self) -> Option<char> {
-        if let Some(ch) = self.iter.next() {
-            self.pos = self.next_pos;
-            self.next_pos += ch.len_utf8();
-            return Some(ch)
-        }
+    fn next_token<'a, S>(first: char, mut source: S) -> Result<Self>
+        where
+            S: Source<'a>,
+            Self: Sized
+    {
+        let begin = source.pos();
+        while let Some(ch) = source.peek() {
+            source.next().unwrap(); // Move cursor forward
 
-        None
-    }
-
-    fn pos(&self) -> usize {
-        self.pos
-    }
-
-    fn slice(&self, range: Range<usize>) -> &'a str {
-        &self.content[range]
-    }
-}
-
-struct Lexer<'a, T: Source<'a>> {
-    source: &'a mut T,
-    context: &'a mut LexerContext
-}
-
-impl<'a, T: Source<'a>> Lexer<'a, T> {
-    pub fn new(source: &'a mut T,
-               context: &'a mut LexerContext) -> Lexer<'a, T> {
-        Lexer {
-            source,
-            context
-        }
-    }
-
-    pub fn next_token(&mut self) -> Result<Token> {
-        while Some(true) == self.source.peek().map(|x| x.is_whitespace()) {
-            self.source.get().expect(&ErrorKind::Eof.to_string());
-        }
-
-        if let Some(ch) = self.source.peek() {
-            debug_assert_eq!(self.source.get(), Some(ch));
-
-            return if ch.is_ascii_digit() {
-                self.number()
-            } else if ch.is_alphabetic() {
-                self.ident_or_keyword()
-            } else if ch.is_delimiter()  {
-                self.delimiter(ch)
-            } else {
-                self.punctuation(ch)
-            }
-        }
-
-        Err(ErrorKind::Eof)
-    }
-
-    fn number(&mut self) -> Result<Token> {
-        let begin = self.source.pos();
-
-        while let Some(ch) = self.source.peek() {
             if !ch.is_ascii_digit() {
-                break
-            } else {
-                self.source.get().unwrap();
+                break;
             }
         }
 
-        let value = self.source.slice(begin..self.source.next_pos());
-        let value: i32 = value.parse()?;
-
-        return Ok(Token::integer(value))
-    }
-
-    fn ident_or_keyword(&mut self) -> Result<Token> {
-        let begin = self.source.pos();
-
-        while let Some(ch) = self.source.peek() {
-            if !ch.is_alphanumeric() && ch != '_' {
-                break
-            } else {
-                self.source.get().unwrap();
-            }
-        }
-
-        let value = self.source.slice(begin..self.source.next_pos());
-
-        match Keyword::from_str(value) {
-            Some(keyword) => Ok(keyword.into()),
-            None => Ok(Identifier::new(self.context.idents_mut(), value).into())
-        }
-    }
-
-    fn delimiter(&mut self, ch: char) -> Result<Token> {
-        match ch {
-            '(' => Ok(Delimiter::opening(DelimiterKind::Parenthesis).into()),
-            ')' => Ok(Delimiter::closing(DelimiterKind::Parenthesis).into()),
-
-            '[' => Ok(Delimiter::opening(DelimiterKind::SquareBracket).into()),
-            ']' => Ok(Delimiter::closing(DelimiterKind::SquareBracket).into()),
-
-            '{' => Ok(Delimiter::opening(DelimiterKind::CurlyBracket).into()),
-            '}' => Ok(Delimiter::closing(DelimiterKind::CurlyBracket).into()),
-
-            _ => Err(ErrorKind::UnexpectedCharacter(ch)),
-        }
-    }
-
-    fn punctuation(&mut self, ch: char) -> Result<Token> {
-        match ch {
-            '+' => Ok(Punctuation::Add.into()),
-            '-' => Ok(Punctuation::Sub.into()),
-            '*' => Ok(Punctuation::Mul.into()),
-            '/' => Ok(Punctuation::Div.into()),
-            '=' => Ok(Punctuation::Assign.into()),
-
-            _ => Err(ErrorKind::UnexpectedCharacter(ch))
+        let span = Span::new(begin, source.pos());
+        let raw_value = source.slice(span);
+        return match raw_value.parse::<LitInt>() {
+            Ok(val) => Ok(val),
+            Err(err) =>
+                Err(Error::new(ParseTokenError::from(err).into(), span))
         }
     }
 }
+
+impl NextToken for LitStr {
+    fn check(ch: char) -> bool {
+        return ch == '"'
+    }
+
+    fn next_token<'a, S>(first: char,mut source: S) -> Result<Self>
+        where
+            S: Source<'a>,
+            Self: Sized
+    {
+        source.next().unwrap(); // Skip quote
+
+        let start = source.pos();
+
+        while let Some(ch) = source.peek() {
+            source.next().unwrap(); // Move cursor forward
+
+            if ch == '"' {
+                break;
+            }
+        }
+
+        let span = Span::new(start, source.pos());
+        let raw_value = source.slice(span);
+
+        source.next().unwrap(); // Skip quote
+
+        // Unwrap will never panic, because the error type is Infallible
+        return Ok(raw_value.parse::<LitStr>().unwrap())
+    }
+}
+
+impl NextToken for LiteralKind {
+    fn check(ch: char) -> bool {
+        LitInt::check(ch) || LitStr::check(ch)
+    }
+
+    fn next_token<'a, S>(first: char, source: S) -> Result<Self>
+        where
+            S: Source<'a>,
+            Self: Sized
+    {
+        try_next_token!(LitInt, first, source);
+        Ok(LitStr::next_token(first, source).unwrap().into())
+    }
+}
+
+impl NextToken for SeparatorKind {
+    fn check(ch: char) -> bool {
+        SeparatorKind::is_separator(ch)
+    }
+
+    fn next_token<'a, S>(first: char, mut source: S) -> Result<Self>
+        where
+            S: Source<'a>,
+            Self: Sized
+    {
+        source.next().unwrap();
+        Ok(SeparatorKind::from_ch(first).unwrap())
+    }
+}
+
+impl NextToken for OperatorKind {
+    fn check(ch: char) -> bool {
+        OperatorKind::starts_with(ch)
+    }
+
+    fn next_token<'a, S>(first: char, mut source: S) -> Result<Self>
+        where
+            S: Source<'a>,
+            Self: Sized
+    {
+        Ok(OperatorKind::from(first, source))
+    }
+}
+
